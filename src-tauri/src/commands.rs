@@ -95,6 +95,77 @@ fn load_task(conn: &Connection, id: &str) -> rusqlite::Result<Task> {
     Ok(task)
 }
 
+/// Renumber a fractional index once fewer than this many representable doubles
+/// remain between two neighbours — about ten more halvings of headroom.
+const MIN_GAP_ULPS: f64 = 1024.0;
+
+/// Whether two adjacent index values have run out of room to insert between.
+///
+/// Measured in ULPs rather than as a fixed distance because these columns are
+/// seeded from a millisecond timestamp (~1e12), where one ULP is already ~4e-4
+/// — an absolute threshold would be either useless there or trigger constantly
+/// on a list that has been renumbered down to 0, 1, 2…
+fn too_close(before: f64, after: f64) -> bool {
+    let ulp = before.abs().max(after.abs()).max(1.0) * f64::EPSILON;
+    after - before < ulp * MIN_GAP_ULPS
+}
+
+/// Rewrite `column` to 0, 1, 2… across `rows` (already in their display order),
+/// but only when some neighbouring pair has run out of room to subdivide.
+///
+/// Each drop halves the gap between the same two neighbours, so after roughly
+/// fifty of them the midpoint is no longer representable and the two rows
+/// collide — the sort then falls through to `created_at` and the card appears
+/// to snap back. Renumbering restores the headroom without changing the order
+/// anyone can see. `updated_at` is bumped on every row it touches so the new
+/// positions reach the user's other devices; this runs rarely enough that the
+/// extra sync traffic does not matter.
+fn renumber_if_crowded(
+    conn: &Connection,
+    column: &str,
+    rows: &[(String, f64)],
+    now: &str,
+) -> rusqlite::Result<bool> {
+    if !rows.windows(2).any(|pair| too_close(pair[0].1, pair[1].1)) {
+        return Ok(false);
+    }
+    for (position, (id, _)) in rows.iter().enumerate() {
+        conn.execute(
+            &format!("UPDATE tasks SET {column} = ?1, updated_at = ?2 WHERE id = ?3"),
+            params![position as f64, now, id],
+        )?;
+    }
+    Ok(true)
+}
+
+/// Every live task in the order the list view shows them (see `list_tasks`).
+fn list_order(conn: &Connection) -> rusqlite::Result<Vec<(String, f64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, order_index FROM tasks
+         WHERE deleted_at IS NULL
+         ORDER BY (status = 'done'), order_index ASC, created_at ASC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+/// Every live task carrying `stage`, in board order. Grouped by the stored slug
+/// rather than the column it renders in: each slug is its own independent run
+/// of `board_index` values, which is what a renumber has to keep consistent.
+fn board_order(conn: &Connection, stage: Option<&str>) -> rusqlite::Result<Vec<(String, f64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, board_index FROM tasks
+         WHERE deleted_at IS NULL AND stage IS ?1
+         ORDER BY board_index ASC, created_at ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![stage], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
 fn set_labels(conn: &Connection, task_id: &str, label_ids: &[String]) -> rusqlite::Result<()> {
     let now = now_iso();
     // Tombstone every current association, then re-assert the desired ones. The
@@ -238,14 +309,6 @@ pub fn update_task(db: State<Db>, patch: TaskPatch) -> CmdResult<Task> {
         )
         .map_err(|e| e.to_string())?;
     }
-    if let Some(stage) = &patch.stage {
-        // `Some(None)` sends the task back to the first board column.
-        conn.execute(
-            "UPDATE tasks SET stage = ?1 WHERE id = ?2",
-            params![stage, patch.id],
-        )
-        .map_err(|e| e.to_string())?;
-    }
     if let Some(subtasks) = &patch.subtasks {
         // Replace the whole checklist. An empty list is stored as `[]`.
         let json = serde_json::to_string(subtasks).map_err(|e| e.to_string())?;
@@ -301,22 +364,39 @@ pub fn snooze_task(app: AppHandle, db: State<Db>, id: String, minutes: i64) -> C
     Ok(task)
 }
 
-/// Set a task's manual order position. The frontend computes `order_index`
-/// as the midpoint between the drop target's neighbors (a fractional index),
-/// so reordering never has to renumber the whole list.
+/// Set a task's manual order position. The frontend computes `order_index` as
+/// the midpoint between the drop target's neighbours (a fractional index), so a
+/// reorder normally writes one row.
+///
+/// Returns every row it moved: usually just this task, but the whole list when
+/// the midpoints had grown too fine and the order had to be renumbered.
 #[tauri::command]
-pub fn reorder_task(db: State<Db>, id: String, order_index: f64) -> CmdResult<Task> {
-    let conn = db.conn();
-    conn.execute(
-        "UPDATE tasks SET order_index = ?1 WHERE id = ?2",
-        params![order_index, id],
-    )
-    .map_err(|e| e.to_string())?;
-    touch_and_load(&conn, &id).map_err(|e| e.to_string())
+pub fn reorder_task(db: State<Db>, id: String, order_index: f64) -> CmdResult<Vec<Task>> {
+    let mut conn = db.conn();
+    reorder_task_inner(&mut conn, &id, order_index).map_err(|e| e.to_string())
+}
+
+fn reorder_task_inner(
+    conn: &mut Connection,
+    id: &str,
+    order_index: f64,
+) -> rusqlite::Result<Vec<Task>> {
+    let now = now_iso();
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE tasks SET order_index = ?1, updated_at = ?2 WHERE id = ?3",
+        params![order_index, now, id],
+    )?;
+    let rows = list_order(&tx)?;
+    let moved = renumber_if_crowded(&tx, "order_index", &rows, &now)?;
+    let tasks = load_moved(&tx, id, &rows, moved)?;
+    tx.commit()?;
+    Ok(tasks)
 }
 
 /// Drop a task into a board column, mirroring `reorder_task` on the board's
-/// own axis. `stage` is the column slug, None for the first column.
+/// own axis. `stage` is the column slug, None for the first column. Returns the
+/// rows it moved, for the same reason `reorder_task` does.
 ///
 /// Done is derived from `status`, so the frontend routes those drops through
 /// `toggle_task` instead and recurring tasks still roll forward.
@@ -326,14 +406,47 @@ pub fn move_task_to_stage(
     id: String,
     stage: Option<String>,
     board_index: f64,
-) -> CmdResult<Task> {
-    let conn = db.conn();
-    conn.execute(
-        "UPDATE tasks SET stage = ?1, board_index = ?2 WHERE id = ?3",
-        params![stage, board_index, id],
-    )
-    .map_err(|e| e.to_string())?;
-    touch_and_load(&conn, &id).map_err(|e| e.to_string())
+) -> CmdResult<Vec<Task>> {
+    let mut conn = db.conn();
+    move_task_to_stage_inner(&mut conn, &id, stage.as_deref(), board_index)
+        .map_err(|e| e.to_string())
+}
+
+fn move_task_to_stage_inner(
+    conn: &mut Connection,
+    id: &str,
+    stage: Option<&str>,
+    board_index: f64,
+) -> rusqlite::Result<Vec<Task>> {
+    let now = now_iso();
+    let tx = conn.transaction()?;
+    tx.execute(
+        "UPDATE tasks SET stage = ?1, board_index = ?2, updated_at = ?3 WHERE id = ?4",
+        params![stage, board_index, now, id],
+    )?;
+    // Read the column back after the write, so the task is already in the group
+    // whose spacing is being checked.
+    let rows = board_order(&tx, stage)?;
+    let moved = renumber_if_crowded(&tx, "board_index", &rows, &now)?;
+    let tasks = load_moved(&tx, id, &rows, moved)?;
+    tx.commit()?;
+    Ok(tasks)
+}
+
+/// The tasks a reorder changed: the whole group after a renumber, otherwise
+/// just the one that was dropped.
+fn load_moved(
+    conn: &Connection,
+    id: &str,
+    rows: &[(String, f64)],
+    renumbered: bool,
+) -> rusqlite::Result<Vec<Task>> {
+    if !renumbered {
+        return Ok(vec![load_task(conn, id)?]);
+    }
+    rows.iter()
+        .map(|(row_id, _)| load_task(conn, row_id))
+        .collect()
 }
 
 #[tauri::command]
@@ -743,10 +856,152 @@ pub fn delete_event(db: State<Db>, id: String) -> CmdResult<()> {
 #[cfg(test)]
 mod command_tests {
     use super::{
-        acknowledge_reminder_inner, delete_label_inner, delete_task_inner, validate_event_range,
+        acknowledge_reminder_inner, delete_label_inner, delete_task_inner,
+        move_task_to_stage_inner, reorder_task_inner, too_close, validate_event_range,
     };
     use crate::db;
     use rusqlite::Connection;
+
+    /// Insert `n` active tasks, evenly spaced on both ordering axes.
+    fn seed_tasks(conn: &Connection, ids: &[&str], stage: Option<&str>) {
+        for (i, id) in ids.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO tasks (id, title, created_at, updated_at, order_index,
+                                    board_index, stage)
+                 VALUES (?1, ?1, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', ?2, ?2, ?3)",
+                rusqlite::params![id, i as f64, stage],
+            )
+            .unwrap();
+        }
+    }
+
+    fn indexes(conn: &Connection, column: &str) -> Vec<(String, f64)> {
+        conn.prepare(&format!(
+            "SELECT id, {column} FROM tasks ORDER BY {column}, created_at"
+        ))
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// The threshold has to hold at the magnitude these columns are actually
+    /// seeded from: `create_task` uses a millisecond timestamp (~1.7e12), where
+    /// one ULP is already ~4e-4 and an absolute epsilon would never fire.
+    #[test]
+    fn crowding_is_detected_at_timestamp_magnitude() {
+        assert!(!too_close(0.0, 1.0), "whole numbers have ample room");
+        assert!(!too_close(1.7e12, 1.7e12 + 1.0), "so does a one-unit gap");
+        assert!(too_close(1.0, 1.0), "equal values cannot be split");
+        assert!(
+            too_close(1.7e12, 1.7e12 + 1e-6),
+            "a gap below one ULP-scale step at 1.7e12 is exhausted"
+        );
+        assert!(
+            !too_close(0.5, 0.5 + 1e-6),
+            "the same absolute gap is still fine near zero"
+        );
+    }
+
+    /// Halving the same gap repeatedly is exactly what dropping a card in the
+    /// same slot does; it must not end with two tasks sharing an index.
+    #[test]
+    fn repeated_drops_into_one_slot_renumber_instead_of_colliding() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::init(&conn).unwrap();
+        seed_tasks(&conn, &["a", "b", "c"], Some("doing"));
+
+        // Wedge "c" between "a" and "b" over and over, always at the midpoint —
+        // the frontend's `indexBetween` with the same two neighbours each time.
+        for _ in 0..80 {
+            let rows = indexes(&conn, "board_index");
+            let before = rows[0].1;
+            let after = rows[1].1;
+            assert!(after > before, "indices collided: {rows:?}");
+            move_task_to_stage_inner(&mut conn, "c", Some("doing"), (before + after) / 2.0)
+                .unwrap();
+        }
+
+        let rows = indexes(&conn, "board_index");
+        assert_eq!(
+            rows.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "c", "b"],
+            "the visible order must survive every renumber"
+        );
+    }
+
+    /// The caller applies the returned rows optimistically, so a renumber has to
+    /// report the whole column rather than only the card that was dragged.
+    #[test]
+    fn a_renumber_reports_every_row_it_moved() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::init(&conn).unwrap();
+        seed_tasks(&conn, &["a", "b", "c"], Some("doing"));
+
+        let moved = move_task_to_stage_inner(&mut conn, "c", Some("doing"), 0.5).unwrap();
+        assert_eq!(moved.len(), 1, "a roomy drop writes one row");
+
+        // Land "c" on top of "a": no room at all, so the column is rewritten.
+        let moved = move_task_to_stage_inner(&mut conn, "c", Some("doing"), 0.0).unwrap();
+        let mut ids: Vec<&str> = moved.iter().map(|t| t.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert_eq!(
+            indexes(&conn, "board_index")
+                .iter()
+                .map(|(_, v)| *v)
+                .collect::<Vec<_>>(),
+            vec![0.0, 1.0, 2.0],
+            "a renumber spaces the column back out to whole numbers"
+        );
+    }
+
+    /// Columns are independent runs of `board_index`, so renumbering one must
+    /// not touch another that still has room.
+    #[test]
+    fn renumbering_a_column_leaves_its_neighbours_alone() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::init(&conn).unwrap();
+        seed_tasks(&conn, &["a", "b"], Some("doing"));
+        conn.execute(
+            "INSERT INTO tasks (id, title, created_at, updated_at, order_index,
+                                board_index, stage)
+             VALUES ('z', 'z', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 9, 7.5, 'blocked')",
+            [],
+        )
+        .unwrap();
+
+        move_task_to_stage_inner(&mut conn, "b", Some("doing"), 0.0).unwrap();
+
+        let blocked: f64 = conn
+            .query_row("SELECT board_index FROM tasks WHERE id = 'z'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(blocked, 7.5, "the blocked column was rewritten too");
+    }
+
+    /// The list axis carries the same hazard and the same fix. The drop lands
+    /// strictly between two neighbours but with nothing left to split — which
+    /// is where `indexBetween` ends up after enough moves into one slot.
+    #[test]
+    fn reordering_the_list_renumbers_when_the_gap_runs_out() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        db::init(&conn).unwrap();
+        seed_tasks(&conn, &["a", "b", "c"], None);
+
+        let moved = reorder_task_inner(&mut conn, "c", f64::MIN_POSITIVE).unwrap();
+        assert_eq!(moved.len(), 3, "a renumber reports the whole list");
+        assert_eq!(
+            indexes(&conn, "order_index")
+                .iter()
+                .map(|(id, value)| (id.as_str(), *value))
+                .collect::<Vec<_>>(),
+            vec![("a", 0.0), ("c", 1.0), ("b", 2.0)],
+            "the drop position survives, spaced back out to whole numbers"
+        );
+    }
 
     #[test]
     fn timed_event_end_must_follow_start() {

@@ -191,6 +191,9 @@ jobs:
       - name: Build frontend
         run: bun run build
 
+      - name: Test frontend
+        run: bun run test
+
       - name: Test Rust backend
         run: cargo test --locked --manifest-path src-tauri/Cargo.toml
 
@@ -263,6 +266,25 @@ jobs:
       - name: Install frontend dependencies
         run: bun install --frozen-lockfile
 
+      # The bundler chmods every tool it downloads to 0770 and then copies
+      # AppRun straight into the AppDir, so the launcher ends up runnable by
+      # nobody but its owner. Nothing goes wrong when the runtime mounts the
+      # image for the user who started it, but a sandbox that mounts it as root
+      # — firejail --appimage, and the AppImage catalog's test — cannot exec it.
+      # The bundler only downloads what is missing, so seed the cache instead.
+      # Remove once tauri-apps/tauri#16155 ships.
+      - name: Seed the AppImage launcher with world-readable permissions
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          set -euo pipefail
+          TOOLS="${XDG_CACHE_HOME:-$HOME/.cache}/tauri"
+          ARCH="$(uname -m)"
+          mkdir -p "$TOOLS"
+          curl --fail --show-error --silent --location --retry 3 \
+            -o "$TOOLS/AppRun-$ARCH" \
+            "https://github.com/tauri-apps/binary-releases/releases/download/apprun-old/AppRun-$ARCH"
+          chmod 755 "$TOOLS/AppRun-$ARCH"
+
       - name: Build and upload bundle
         uses: tauri-apps/tauri-action@v0
         env:
@@ -287,6 +309,31 @@ jobs:
           # The manifest is composed once, after every platform has uploaded —
           # three parallel jobs each merging their own copy would race.
           includeUpdaterJson: false
+
+      # The seed above is a workaround for a bundler bug, so assert the result
+      # rather than trust it: anything an AppImage keeps to its owner is broken
+      # for sandboxed users. The asset is already on the release by now, but the
+      # release is a draft and `publish` needs this job, so failing here keeps it
+      # from reaching anyone.
+      - name: Reject owner-only files inside the AppImage
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          set -euo pipefail
+          APPIMAGE="$(ls -1 src-tauri/target/release/bundle/appimage/*.AppImage | head -1)"
+          APPIMAGE="$(readlink -f "$APPIMAGE")"
+          chmod +x "$APPIMAGE"
+          WORKDIR="$(mktemp -d)"
+          cd "$WORKDIR"
+          "$APPIMAGE" --appimage-extract >/dev/null
+          # Flag anything unreadable by other, or executable by its owner alone.
+          OWNER_ONLY="$(find squashfs-root \( -type f -o -type d \) \
+            \( ! -perm -004 -o \( -perm -100 -a ! -perm -001 \) \) -printf '%M %p\n')"
+          if [ -n "$OWNER_ONLY" ]; then
+            echo "::error::$(basename "$APPIMAGE") holds files no other user can read or run:"
+            printf '%s\n' "$OWNER_ONLY"
+            exit 1
+          fi
+          echo "Every file in $(basename "$APPIMAGE") is readable and runnable by any user."
 
   voice-engine:
     needs: [check, validate, release]

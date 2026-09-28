@@ -55,11 +55,17 @@ export const COLUMN_ORDER: ColumnId[] = [
   DONE_COLUMN,
 ];
 
+/**
+ * The stage a task holds regardless of whether it is finished. An unrecognised
+ * slug reads as the first column, so a task never disappears from the board.
+ */
+export function stageOf(task: Task): StageSlug {
+  return STAGES.find((s) => s.slug === task.stage)?.slug ?? STAGES[0].slug;
+}
+
 /** Which column a task renders in. Completed always wins over its stage. */
 export function columnOf(task: Task): ColumnId {
-  if (task.status === "done") return DONE_COLUMN;
-  const stage = STAGES.find((s) => s.slug === task.stage);
-  return stage ? stage.slug : STAGES[0].slug;
+  return task.status === "done" ? DONE_COLUMN : stageOf(task);
 }
 
 /**
@@ -120,11 +126,14 @@ export function nudgeColumn(
   tasks: Task[],
   direction: 1 | -1,
 ): { column: ColumnId; boardIndex: number } | null {
-  const from = COLUMN_ORDER.indexOf(columnOf(task));
-  const to = from + direction;
+  const current = columnOf(task);
+  const to = COLUMN_ORDER.indexOf(current) + direction;
   if (to < 0 || to >= COLUMN_ORDER.length) return null;
 
-  const column = COLUMN_ORDER[to];
+  // Leaving Done re-opens the task, and `stage` still records where it was
+  // working before it was finished — so it goes back there rather than to
+  // whichever column happens to sit to the left of Done.
+  const column = current === DONE_COLUMN ? stageOf(task) : COLUMN_ORDER[to];
   const last = tasks
     .filter((t) => t.id !== task.id && columnOf(t) === column)
     .reduce((max, t) => Math.max(max, t.boardIndex), Number.NEGATIVE_INFINITY);

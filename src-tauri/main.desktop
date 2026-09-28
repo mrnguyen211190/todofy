@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=Todofy
+GenericName=To-Do List
+{{#if comment}}
+Comment={{comment}}
+{{/if}}
+Exec={{exec}} %u
+StartupWMClass={{exec}}
+Icon={{icon}}
+Terminal=false
+Categories=Office;ProjectManagement;
+Keywords=todo;task;tasks;reminder;checklist;kanban;pomodoro;journal;
+{{#if mime_type}}
+MimeType={{mime_type}}
+{{/if}}

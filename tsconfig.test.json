@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    /* `bun:test` and the Bun globals, which the app build deliberately omits. */
+    "types": ["bun"]
+  },
+  /* Clears the base config's exclusion of exactly these files. */
+  "exclude": [],
+  "include": ["src/**/*.test.ts"]
+}

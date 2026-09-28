@@ -97,9 +97,9 @@ pub struct TaskPatch {
     /// `Some(None)` clears the estimate; `Some(Some(minutes))` sets it.
     #[serde(default, deserialize_with = "double_option")]
     pub estimate_minutes: Option<Option<i64>>,
-    /// `Some(None)` moves the task back to the first board column.
-    #[serde(default, deserialize_with = "double_option")]
-    pub stage: Option<Option<String>>,
+    // No `stage` here on purpose: a board move also has to assign a position
+    // within the target column, so it goes through `move_task_to_stage`.
+    // Setting the slug alone would leave the task at its old `board_index`.
 }
 
 /// A free-form journal entry. Grouped by `entry_date` for the calendar rail.

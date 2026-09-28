@@ -125,7 +125,8 @@ export interface TaskPatch {
   repeat?: RepeatRule | null;
   subtasks?: Subtask[];
   estimateMinutes?: number | null;
-  stage?: string | null;
+  // `stage` is deliberately absent: a board move also assigns a position in the
+  // target column, so it goes through `api.moveTaskToStage`.
 }
 
 /** A reminder that has fired, shown as an in-app toast. */

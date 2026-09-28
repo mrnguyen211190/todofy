@@ -19,10 +19,12 @@ export const api = {
   listTasks: () => invoke<Task[]>("list_tasks"),
   createTask: (task: NewTask) => invoke<Task>("create_task", { task }),
   updateTask: (patch: TaskPatch) => invoke<Task>("update_task", { patch }),
+  // Both resolve to every task the move repositioned — just the dropped one,
+  // unless the fractional indices had to be renumbered (see `reorder_task`).
   reorderTask: (id: string, orderIndex: number) =>
-    invoke<Task>("reorder_task", { id, orderIndex }),
+    invoke<Task[]>("reorder_task", { id, orderIndex }),
   moveTaskToStage: (id: string, stage: string | null, boardIndex: number) =>
-    invoke<Task>("move_task_to_stage", { id, stage, boardIndex }),
+    invoke<Task[]>("move_task_to_stage", { id, stage, boardIndex }),
   toggleTask: (id: string, done: boolean) =>
     invoke<Task>("toggle_task", { id, done }),
   deleteTask: (id: string) => invoke<void>("delete_task", { id }),

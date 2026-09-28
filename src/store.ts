@@ -292,7 +292,11 @@ export const useStore = create<State>((set, get) => ({
       ),
     });
     try {
-      await api.reorderTask(id, orderIndex);
+      // A drop can exhaust the gap between two neighbours, in which case the
+      // backend renumbers the list and hands back every row it moved — the
+      // guess above only covered this one.
+      const moved = await api.reorderTask(id, orderIndex);
+      set({ tasks: mergeTasks(get().tasks, moved) });
     } catch {
       // Fall back to the source of truth if the write failed.
       await get().load();
@@ -317,7 +321,8 @@ export const useStore = create<State>((set, get) => ({
       ),
     });
     try {
-      await api.moveTaskToStage(id, column, boardIndex);
+      const moved = await api.moveTaskToStage(id, column, boardIndex);
+      set({ tasks: mergeTasks(get().tasks, moved) });
     } catch {
       // Fall back to the source of truth if the write failed.
       await get().load();
@@ -558,6 +563,13 @@ function sortTasks(tasks: Task[]): Task[] {
       a.orderIndex - b.orderIndex ||
       a.createdAt.localeCompare(b.createdAt),
   );
+}
+
+/** Replace the tasks the backend just rewrote, leaving the rest untouched. */
+function mergeTasks(tasks: Task[], updated: Task[]): Task[] {
+  if (updated.length === 0) return tasks;
+  const byId = new Map(updated.map((t) => [t.id, t]));
+  return sortTasks(tasks.map((t) => byId.get(t.id) ?? t));
 }
 
 /** Newest first: by entry date, then creation time. Mirrors `list_journal`. */

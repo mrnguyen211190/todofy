@@ -42,6 +42,8 @@ export function useBoardDrag(
   const overRef = useRef<DropTarget | null>(null);
   const draggingRef = useRef(false);
   const autoScroll = useRef(0);
+  /** Detaches the in-flight drag's document listeners; null when idle. */
+  const detachRef = useRef<(() => void) | null>(null);
 
   const setCardRef = (id: string) => (el: HTMLElement | null) => {
     if (el) cards.current.set(id, el);
@@ -138,6 +140,9 @@ export function useBoardDrag(
   const startDrag =
     (id: string) => (e: JSX.TargetedPointerEvent<HTMLElement>) => {
       if (e.button !== 0) return;
+      // A press that somehow arrives with a drag still in flight replaces it,
+      // rather than stacking a second set of document listeners.
+      detachRef.current?.();
       const originX = e.clientX;
       const originY = e.clientY;
       dragIdRef.current = id;
@@ -163,10 +168,15 @@ export function useBoardDrag(
         runAutoScroll(ev.clientX);
       };
 
-      const onUp = () => {
+      const detach = () => {
         document.removeEventListener("pointermove", onMove);
         document.removeEventListener("pointerup", onUp);
         document.removeEventListener("pointercancel", onUp);
+        detachRef.current = null;
+      };
+
+      const onUp = () => {
+        detach();
         // Swallow the click the browser fires on release, so finishing a drag
         // on a card doesn't also open it.
         if (draggingRef.current) {
@@ -189,6 +199,7 @@ export function useBoardDrag(
         commit();
       };
 
+      detachRef.current = detach;
       document.addEventListener("pointermove", onMove);
       document.addEventListener("pointerup", onUp);
       // A cancelled pointer never fires pointerup, which would leave the
@@ -196,8 +207,16 @@ export function useBoardDrag(
       document.addEventListener("pointercancel", onUp);
     };
 
-  // Leaving the board mid-drag would otherwise strand the scroll loop.
-  useEffect(() => stopAutoScroll, []);
+  // Leaving the board mid-drag would otherwise strand the scroll loop and
+  // leave the document listeners bound to an unmounted component — they are
+  // only torn down on pointerup, which never arrives once the board is gone.
+  useEffect(
+    () => () => {
+      detachRef.current?.();
+      stopAutoScroll();
+    },
+    [],
+  );
 
   return { dragId, over, setCardRef, setColumnRef, setScrollerRef, startDrag };
 }

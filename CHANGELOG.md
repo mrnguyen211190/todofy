@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.13.1 — 2026-09-28
+
+### Fixed
+
+- **A card dropped in the same place over and over stops snapping back.** Both the list's manual order and the board's own order place a moved card at the midpoint between its two new neighbours, which keeps a drag from having to renumber everything around it — but each drop into the same gap halves it, and after about fifty the midpoint is no longer a distinct number. The two cards then tied, the order fell back to which was created first, and the card you had just placed jumped somewhere else. Todofy now notices when a gap has run that fine and quietly renumbers the column, which leaves the order you can see untouched and restores the room to keep dropping. Any card the renumber moved is sent back to the window, so the board never shows positions the database has already changed
+- **Dragging a card out of _Done_ returns it to the column it came from.** It used to land in whichever column happens to sit to the left of _Done_, so a task you had finished while it was _Blocked_ re-opened as _In progress_. Its stage is still recorded while it is complete, and re-opening it now uses that
+- **The Linux AppImage starts inside a sandbox again.** Its launcher was packaged readable only by the user who owned it, which is invisible when you run the AppImage yourself — the runtime hands you the files as your own — but fatal wherever something else mounts the image on your behalf. `firejail --appimage` refused to start it, and so did the AppImage catalog, which tests every app that way. The launcher is now readable and runnable by anyone, and a release that packages an owner-only file again fails its build instead of shipping ([tauri-apps/tauri#16155](https://github.com/tauri-apps/tauri/issues/16155))
+- **todofy is filed under Office in your application menu.** The `.deb`, `.rpm` and AppImage all shipped a desktop entry with an empty category list, so desktop environments had nowhere to put it and menus that group by category left it out. The entry now also hands a `todofy://` link to the app as an argument, the way a scheme handler is supposed to, so a link opened before todofy has ever run still arrives instead of being dropped
+
+### Added
+
+- **Linux software centres recognise todofy.** The Linux packages now carry AppStream metadata, so GNOME Software, Discover and AppImageHub show a proper name, summary, description, screenshots and release history rather than a bare desktop entry
+
 ## v1.13.0 — 2026-09-20
 
 ### Added

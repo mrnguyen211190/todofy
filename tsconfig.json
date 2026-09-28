@@ -5,6 +5,11 @@
     "module": "ESNext",
     "lib": ["ES2020", "DOM", "DOM.Iterable"],
     "skipLibCheck": true,
+    /* No ambient @types packages: this bundle runs in a webview, and every
+       @types/* in node_modules would otherwise be injected globally. Bun's and
+       Node's both redefine ArrayBuffer. `vite/client` comes in explicitly via
+       the reference in vite-env.d.ts. */
+    "types": [],
 
     /* Bundler mode */
     "moduleResolution": "bundler",
@@ -21,6 +26,9 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
+  /* Tests are checked by tsconfig.test.json, which adds Bun's globals. Those
+     redefine ArrayBuffer and friends, so they are kept out of the app build. */
   "include": ["src"],
+  "exclude": ["src/**/*.test.ts"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

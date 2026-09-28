@@ -41,5 +41,8 @@ jobs:
       - name: Typecheck & build frontend
         run: bun run build
 
+      - name: Test frontend
+        run: bun run test
+
       - name: Check Rust backend
         run: cargo check --locked --manifest-path src-tauri/Cargo.toml

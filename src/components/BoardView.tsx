@@ -1,5 +1,5 @@
-import type { JSX } from "preact";
-import { useState } from "preact/hooks";
+import { Fragment, type JSX } from "preact";
+import { useMemo, useState } from "preact/hooks";
 import { applySearchAndFilters, useStore } from "../store";
 import {
   boardColumns,
@@ -12,7 +12,7 @@ import {
   type BoardScope,
 } from "../lib/board";
 import { useBoardDrag } from "../lib/useBoardDrag";
-import { formatDue, isPast } from "../lib/dates";
+import { formatDue, isPast, today } from "../lib/dates";
 import { formatDuration, formatMinutes } from "../lib/duration";
 import { overEstimateBy, trackedElapsed, trackingState } from "../lib/tracking";
 import { useTick } from "../lib/useTick";
@@ -62,13 +62,23 @@ export function BoardView() {
     writeBoardScope(next);
   };
 
-  const visible = applySearchAndFilters(
-    tasks,
-    searchQuery,
-    filterLabelIds,
-    filterPriorities,
-  ).filter((task) => inScope(task, scope));
-  const columns = boardColumns(visible);
+  // Re-grouped only when something it reads actually changes: a drag calls
+  // `setOver` on every pointermove, and re-filtering plus re-sorting every
+  // column on each of those is the board's hottest path. `day` is a dependency
+  // because `inScope` reads the clock — without it a scoped board would still
+  // be showing yesterday after midnight.
+  const day = today();
+  const visible = useMemo(
+    () =>
+      applySearchAndFilters(
+        tasks,
+        searchQuery,
+        filterLabelIds,
+        filterPriorities,
+      ).filter((task) => inScope(task, scope)),
+    [tasks, searchQuery, filterLabelIds, filterPriorities, scope, day],
+  );
+  const columns = useMemo(() => boardColumns(visible), [visible]);
 
   const { dragId, over, setCardRef, setColumnRef, setScrollerRef, startDrag } =
     useBoardDrag(columns, moveTaskToColumn);
@@ -141,10 +151,13 @@ export function BoardView() {
                     </p>
                   )}
                   {column.tasks.map((task, index) => (
-                    <>
+                    // The fragment is the list item, so the key belongs here:
+                    // on the card it would leave this list diffing by position,
+                    // and the drop slot appearing between cards mid-drag would
+                    // remount them — restarting the tracked-time clocks.
+                    <Fragment key={task.id}>
                       {slot === index && <DropSlot />}
                       <BoardCard
-                        key={task.id}
                         task={task}
                         selected={task.id === selectedId}
                         dragging={task.id === dragId}
@@ -152,7 +165,7 @@ export function BoardView() {
                         onPointerDown={startDrag(task.id)}
                         onSelect={() => select(task.id)}
                       />
-                    </>
+                    </Fragment>
                   ))}
                   {slot !== null && slot >= column.tasks.length && <DropSlot />}
                 </div>
